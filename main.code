@@ -1,0 +1,275 @@
+% Author: Yusuf Hakan Usta - 2024
+% Copyright: University of Manchester, Division of cell matrix biology - Richardson Lab.
+% 2024
+
+% Clear workspace and command window
+close all;
+clc;
+
+% Set up parameters
+factor = 0.53; % 20x axio objective (adjust as needed)
+
+% Define directory and import images
+dir_path = '/Users/user/Desktop/Images';
+files = dir(fullfile(dir_path, '*.tif'));
+num_files = length(files);
+
+% Import images
+all_data = cell(1, num_files);
+for j = 1:num_files
+    all_data{j} = imread(fullfile(dir_path, files(j).name));
+end
+
+num_positions = num_files / 4;
+
+% Separate channels
+images_actin = cell(1, num_positions);
+images_nucleus = cell(1, num_positions);
+images_focal = cell(1, num_positions);
+images_total = cell(1, num_positions);
+
+for i = 1:num_positions
+    images_actin{i} = all_data{2 + (i-1)*4};
+    images_nucleus{i} = all_data{3 + (i-1)*4};
+    images_focal{i} = all_data{4 + (i-1)*4};
+    images_total{i} = all_data{1 + (i-1)*4};
+end
+
+% Remove background and adjust images
+transform_actin = cellfun(@imadjust, images_actin, 'UniformOutput', false);
+transform_nucleus = cellfun(@imadjust, images_nucleus, 'UniformOutput', false);
+
+remove_background_actin = cellfun(@(x) imtophat(x, strel('disk', 15)), transform_actin, 'UniformOutput', false);
+remove_background_nucleus = cellfun(@(x) imtophat(x, strel('disk', 10)), transform_nucleus, 'UniformOutput', false);
+
+tophat_transform_focal = cellfun(@(x) imtophat(x, strel('disk', 40)), images_focal, 'UniformOutput', false);
+median_filtered_7 = cellfun(@(x) medfilt2(x, [7 7]), tophat_transform_focal, 'UniformOutput', false);
+remove_background_7 = cellfun(@(x,y) imsubtract(x, y), tophat_transform_focal, median_filtered_7, 'UniformOutput', false);
+
+actin_adjusted = remove_background_actin;
+nucleus_adjusted = remove_background_nucleus;
+focal_adjusted = remove_background_7;
+
+% Binarize images
+bin_blue = cellfun(@(x) imbinarize(imerode(imfill(imdilate(x, strel('disk', 1)), 'holes'), strel('disk', 1))), nucleus_adjusted, 'UniformOutput', false);
+bin_actin = cellfun(@(x) bwareafilt(imbinarize(imerode(imfill(imdilate(x, strel('disk', 1)), 'holes'), strel('disk', 1)), 'adaptive'), [20/factor^2, Inf]), actin_adjusted, 'UniformOutput', false);
+
+quantify_focal_7 = cellfun(@imbinarize, remove_background_7, 'UniformOutput', false);
+image_adhesions_7 = cellfun(@(x) label2rgb(bwlabel(x)), quantify_focal_7, 'UniformOutput', false);
+compose_focal = cellfun(@(x,y) imfuse(x, y, 'blend'), images_focal, image_adhesions_7, 'UniformOutput', false);
+
+% Crop images (if needed)
+border = 5;
+actin_crop = cellfun(@(x) x(border+1:end-border, border+1:end-border), bin_actin, 'UniformOutput', false);
+cell_crop = cellfun(@(x) x(border+1:end-border, border+1:end-border), actin_adjusted, 'UniformOutput', false);
+nucleus_crop = cellfun(@(x) x(border+1:end-border, border+1:end-border), bin_blue, 'UniformOutput', false);
+focal_crop = cellfun(@(x) x(border+1:end-border, border+1:end-border), quantify_focal_7, 'UniformOutput', false);
+
+% Multiple cells analysis
+marker = 0.15;
+area_cell = 10 / factor^2;
+
+dist_green_select = cellfun(@(x) imadjust(bwdist(x)), actin_crop, 'UniformOutput', false);
+marker_green_select = cellfun(@(x) imregionalmax(x, 8), dist_green_select, 'UniformOutput', false);
+
+% Modified watershed step
+watershed_components_green_select = cell(size(dist_green_select));
+for i = 1:numel(dist_green_select)
+    complement_image = imcomplement(dist_green_select{i});
+    marker_image = marker_green_select{i};
+    watershed_result = watershed(imimposemin(complement_image, marker_image));
+    
+    % Convert watershed_result to logical
+    watershed_result_logical = watershed_result > 0;
+    
+    % Check if actin_crop is already logical, if not, binarize it
+    if ~islogical(actin_crop{i})
+        actin_crop_logical = imbinarize(actin_crop{i});
+    else
+        actin_crop_logical = actin_crop{i};
+    end
+    
+    % Perform the logical AND operation
+    watershed_components_green_select{i} = watershed_result_logical & actin_crop_logical;
+end
+
+image_select = cellfun(@(x) label2rgb(x), watershed_components_green_select, 'UniformOutput', false);
+
+% Select cells and perform measurements
+select_all_actin = image_select;
+select_actin_no_colour = cellfun(@(x) x(:,:,1), select_all_actin, 'UniformOutput', false);  % Take the first channel if RGB
+select_actin_old = cellfun(@(x) bwareaopen(imclearborder(x), 0), select_actin_no_colour, 'UniformOutput', false);
+
+% Modified select_actin step
+select_actin = cell(size(select_actin_old));
+for i = 1:numel(select_actin_old)
+    select_actin_old_2d = select_actin_old{i};
+    
+    % Ensure it's logical
+    select_actin_old_2d = logical(select_actin_old_2d);
+    
+    % Apply bwareafilt
+    select_actin{i} = bwareafilt(select_actin_old_2d, [area_cell/factor^2, Inf]);
+end
+
+% Modified select_cell, select_nucleus, and select_focal steps
+select_cell = cellfun(@(x,y) double(x) .* double(y), cell_crop, select_actin, 'UniformOutput', false);
+select_nucleus = cellfun(@(x,y) imfill(double(x) .* double(y), 'holes'), nucleus_crop, select_actin, 'UniformOutput', false);
+select_focal = cellfun(@(x,y) imfill(double(x) .* double(y), 'holes'), focal_crop, select_actin, 'UniformOutput', false);
+
+% Initialize arrays to store measurements
+max_cells = max(cellfun(@(x) max(bwlabel(x(:))), select_actin));
+cell_areas = zeros(num_positions, max_cells);
+cell_long_axes = zeros(num_positions, max_cells);
+cell_short_axes = zeros(num_positions, max_cells);
+cell_elongations = zeros(num_positions, max_cells);
+cell_perimeters = zeros(num_positions, max_cells);
+cell_orientations = zeros(num_positions, max_cells);
+
+nucleus_areas = zeros(num_positions, max_cells);
+nucleus_long_axes = zeros(num_positions, max_cells);
+nucleus_short_axes = zeros(num_positions, max_cells);
+nucleus_elongations = zeros(num_positions, max_cells);
+nucleus_perimeters = zeros(num_positions, max_cells);
+nucleus_orientations = zeros(num_positions, max_cells);
+
+focal_areas = cell(num_positions, 1);
+focal_long_axes = cell(num_positions, 1);
+focal_short_axes = cell(num_positions, 1);
+focal_elongations = cell(num_positions, 1);
+focal_orientations = cell(num_positions, 1);
+focal_distances = cell(num_positions, 1);
+
+% Perform measurements on cells, nuclei, and focal adhesions
+for i = 1:num_positions
+    % Cell measurements
+    cell_props = regionprops(logical(select_actin{i}), 'Area', 'MajorAxisLength', 'MinorAxisLength', 'Orientation', 'Perimeter');
+    cell_areas(i,1:length(cell_props)) = [cell_props.Area] * factor^2;
+    cell_long_axes(i,1:length(cell_props)) = [cell_props.MajorAxisLength] * factor;
+    cell_short_axes(i,1:length(cell_props)) = [cell_props.MinorAxisLength] * factor;
+    cell_elongations(i,1:length(cell_props)) = [cell_props.MajorAxisLength] ./ [cell_props.MinorAxisLength];
+    cell_perimeters(i,1:length(cell_props)) = [cell_props.Perimeter] * factor;
+    cell_orientations(i,1:length(cell_props)) = [cell_props.Orientation];
+    
+    % Nucleus measurements
+    nucleus_props = regionprops(logical(select_nucleus{i}), 'Area', 'MajorAxisLength', 'MinorAxisLength', 'Orientation', 'Perimeter', 'Centroid');
+    nucleus_areas(i,1:length(nucleus_props)) = [nucleus_props.Area] * factor^2;
+    nucleus_long_axes(i,1:length(nucleus_props)) = [nucleus_props.MajorAxisLength] * factor;
+    nucleus_short_axes(i,1:length(nucleus_props)) = [nucleus_props.MinorAxisLength] * factor;
+    nucleus_elongations(i,1:length(nucleus_props)) = [nucleus_props.MajorAxisLength] ./ [nucleus_props.MinorAxisLength];
+    nucleus_perimeters(i,1:length(nucleus_props)) = [nucleus_props.Perimeter] * factor;
+    nucleus_orientations(i,1:length(nucleus_props)) = [nucleus_props.Orientation];
+    
+    % Focal adhesion measurements
+    focal_props = regionprops(logical(select_focal{i}), 'Area', 'MajorAxisLength', 'MinorAxisLength', 'Orientation', 'Centroid');
+    focal_areas{i} = [focal_props.Area] * factor^2;
+    focal_long_axes{i} = [focal_props.MajorAxisLength] * factor;
+    focal_short_axes{i} = [focal_props.MinorAxisLength] * factor;
+    focal_elongations{i} = [focal_props.MajorAxisLength] ./ [focal_props.MinorAxisLength];
+    focal_orientations{i} = [focal_props.Orientation];
+    
+    % Calculate distances between focal adhesions and nucleus centroid
+    if ~isempty(nucleus_props)
+        nucleus_centroid = nucleus_props(1).Centroid;
+        focal_centroids = cat(1, focal_props.Centroid);
+        focal_distances{i} = sqrt(sum((focal_centroids - nucleus_centroid).^2, 2)) * factor;
+    else
+        focal_distances{i} = [];
+    end
+end
+
+% Prepare data for export
+headers = {'Cell Area', 'Cell Long Axis', 'Cell Short Axis', 'Cell Elongation', 'Cell Perimeter', 'Cell Orientation', ...
+           'Nucleus Area', 'Nucleus Long Axis', 'Nucleus Short Axis', 'Nucleus Elongation', 'Nucleus Perimeter', 'Nucleus Orientation', ...
+           'Focal Area', 'Focal Long Axis', 'Focal Short Axis', 'Focal Elongation', 'Focal Orientation', 'Focal Distance to Nucleus'};
+
+% Initialize a cell array to store all data
+all_data = cell(num_positions * max_cells, length(headers));
+
+% Fill the all_data cell array
+row = 1;
+for i = 1:num_positions
+    for j = 1:max_cells
+        all_data{row, 1} = cell_areas(i, j);
+        all_data{row, 2} = cell_long_axes(i, j);
+        all_data{row, 3} = cell_short_axes(i, j);
+        all_data{row, 4} = cell_elongations(i, j);
+        all_data{row, 5} = cell_perimeters(i, j);
+        all_data{row, 6} = cell_orientations(i, j);
+        all_data{row, 7} = nucleus_areas(i, j);
+        all_data{row, 8} = nucleus_long_axes(i, j);
+        all_data{row, 9} = nucleus_short_axes(i, j);
+        all_data{row, 10} = nucleus_elongations(i, j);
+        all_data{row, 11} = nucleus_perimeters(i, j);
+        all_data{row, 12} = nucleus_orientations(i, j);
+        
+        % For focal adhesion data, use cell arrays to handle variable number of measurements
+        if ~isempty(focal_areas{i})
+            all_data{row, 13} = focal_areas{i};
+            all_data{row, 14} = focal_long_axes{i};
+            all_data{row, 15} = focal_short_axes{i};
+            all_data{row, 16} = focal_elongations{i};
+            all_data{row, 17} = focal_orientations{i};
+            all_data{row, 18} = focal_distances{i};
+        end
+        
+        row = row + 1;
+    end
+end
+
+% Remove empty rows
+all_data = all_data(~all(cellfun(@isempty, all_data), 2), :);
+
+% Export data to Excel
+writecell([headers; all_data], 'cell_measurements.xlsx');
+
+% Save figures
+figure;
+for i = 1:num_positions
+    subplot(2,2,1); imshow(select_actin{i}); title('Actin');
+    subplot(2,2,2); imshow(select_nucleus{i}); title('Nucleus');
+    subplot(2,2,3); imshow(select_focal{i}); title('Focal Adhesions');
+    subplot(2,2,4); imshow(images_total{i}); title('Composite');
+    saveas(gcf, sprintf('cell_image_%d.png', i));
+end
+
+% Additional analysis (e.g., statistics, plotting)
+mean_cell_area = mean(cell_areas(:));
+std_cell_area = std(cell_areas(:));
+mean_focal_count = mean(cellfun(@numel, focal_areas));
+
+figure;
+histogram(cell_areas(:));
+title('Distribution of Cell Areas');
+xlabel('Area (µm^2)');
+ylabel('Frequency');
+saveas(gcf, 'cell_area_distribution.png');
+
+% Correlation analysis
+[r_area_elongation, p_area_elongation] = corrcoef(cell_areas(:), cell_elongations(:), 'rows', 'complete');
+fprintf('Correlation between cell area and elongation: r = %.2f, p = %.4f\n', r_area_elongation(1,2), p_area_elongation(1,2));
+
+% Scatter plot of cell area vs elongation
+figure;
+scatter(cell_areas(:), cell_elongations(:));
+title('Cell Area vs Elongation');
+xlabel('Cell Area (µm^2)');
+ylabel('Cell Elongation');
+saveas(gcf, 'cell_area_vs_elongation.png');
+
+% Box plot of focal adhesion areas
+figure;
+boxplot(cat(1, focal_areas{:}));
+title('Distribution of Focal Adhesion Areas');
+ylabel('Focal Adhesion Area (µm^2)');
+saveas(gcf, 'focal_adhesion_area_boxplot.png');
+
+% Save all variables
+save('full_analysis_results.mat');
+
+% Display summary statistics
+fprintf('Analysis complete. Summary statistics:\n');
+fprintf('Mean cell area: %.2f µm^2\n', mean_cell_area);
+fprintf('Standard deviation of cell area: %.2f µm^2\n', std_cell_area);
+fprintf('Mean number of focal adhesions per cell: %.2f\n', mean_focal_count);
+%
